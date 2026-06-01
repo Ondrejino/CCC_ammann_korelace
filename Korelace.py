@@ -7,8 +7,8 @@ import io
 import csv
 import math
 
-st.set_page_config(page_title="CCC Historie a Analýza Zkoušky", layout="wide")
-st.title("📈 CCC: Komplexní historie pojezdů a vývoj Kb")
+st.set_page_config(page_title="CCC Historie a Analýza Zkoušky v4", layout="wide")
+st.title("📈 CCC: Komplexní historie pojezdů (Opravená Kinematika)")
 st.caption("Globální přehled -> Lokální detail -> Chronologická historie hutnění na bodu zkoušky.")
 
 # --- PARSOVÁNÍ DAT ---
@@ -35,7 +35,7 @@ def najdi_sloupec(columns, klicova_slova):
 
 # --- UI SIDEBAR ---
 with st.sidebar:
-    st.header("📂 Vstupní data")
+    st.header("📂 1. Vstupní data ze stroje")
     uploaded_file = st.file_uploader("Nahrát CSV z válce", type=['csv'])
     
     if uploaded_file:
@@ -46,14 +46,18 @@ with st.sidebar:
         col_stiff = st.selectbox("Tuhost (Kb)", df_raw.columns, index=df_raw.columns.get_loc(najdi_sloupec(df_raw.columns, ['stiff', 'kb', 'cmv'])))
         col_vib = st.selectbox("Amplituda/Vibrace", [None] + list(df_raw.columns), index=0)
         
-        st.header("🎯 Místo zkoušky")
+        # NOVÉ: Parametry pro směr jízdy kvůli offsetům
+        col_dir = st.selectbox("Směr jízdy (Důležité pro offset!)", [None] + list(df_raw.columns), index=list(df_raw.columns).index(najdi_sloupec(df_raw.columns, ['dir', 'smer'])) + 1 if najdi_sloupec(df_raw.columns, ['dir', 'smer']) else 0)
+        forward_val = st.text_input("Znak/Číslo pro jízdu VPŘED (např. 1 nebo F)", value="1")
+        
+        st.header("🎯 2. Místo zkoušky")
         target_lat = st.number_input("Zkouška Y (Lat)", value=50.0791600, format="%.7f")
         target_lon = st.number_input("Zkouška X (Lon)", value=14.5930200, format="%.7f")
         
-        st.header("📐 Stroj")
-        offset_fwd = st.number_input("Podélný posun antény (m)", value=2.00)
-        offset_right = st.number_input("Příčný posun antény (m)", value=0.00)
-        roller_width = st.number_input("Šířka běhounu (m)", value=2.10)
+        st.header("📐 3. Stroj a senzory")
+        offset_fwd = st.number_input("Podélný posun antény (m)", value=2.65, step=0.05)
+        offset_right = st.number_input("Příčný posun antény (m)", value=0.26, step=0.05)
+        roller_width = st.number_input("Šířka běhounu (m)", value=2.10, step=0.05)
 
 # --- JÁDRO A VÝPOČTY ---
 if uploaded_file is not None:
@@ -68,37 +72,47 @@ if uploaded_file is not None:
 
     geod = Geod(ellps="WGS84")
 
-    # KINEMATIKA & POJEZDY
+    # 1. HLAVNÍ KINEMATIKA: Směr pohybu z GPS
     df['smooth_lon'] = df['lon'].rolling(3, min_periods=1, center=True).mean()
     df['smooth_lat'] = df['lat'].rolling(3, min_periods=1, center=True).mean()
     fwd_az, _, _ = geod.inv(df['smooth_lon'].shift().bfill().values, df['smooth_lat'].shift().bfill().values, df['smooth_lon'].values, df['smooth_lat'].values)
-    df['heading'] = fwd_az % 360
+    gps_heading = fwd_az % 360
     
-    # Detekce pojezdů (časová díra > 10s NEBO změna směru > 90 stupňů)
+    # 2. DETEKCE POJEZDŮ (Podle pohybu GPS a času)
     df['dt'] = df['parsed_time'].diff().dt.total_seconds().fillna(0)
-    diff_h = (df['heading'] - df['heading'].shift().bfill()) % 360
-    dir_change = np.minimum(diff_h, 360 - diff_h) > 90
+    diff_h = (gps_heading - pd.Series(gps_heading).shift().bfill()) % 360
+    dir_change = (np.minimum(diff_h, 360 - diff_h) > 90) # Pokud se směr pohybu změní o > 90 stupňů, válec začal couvat
     df['pass_id'] = ((df['dt'] > 10) | dir_change).cumsum() + 1
     
-    # Promítnutí na střed válce
-    df['mid_lon'], df['mid_lat'], _ = geod.fwd(df['lon'].values, df['lat'].values, df['heading'].values, np.full(len(df), offset_fwd))
-    h_right = (df['heading'] - 90) % 360 if offset_right < 0 else (df['heading'] + 90) % 360
+    # 3. OPRAVA OFFSETŮ: Fyzické natočení stroje
+    if col_dir and col_dir in df.columns:
+        is_fwd = (df[col_dir].astype(str).str.strip() == str(forward_val)).values
+        # Pokud couvá, čumák stroje zůstává natočený opačně než směr pohybu
+        df['machine_heading'] = np.where(is_fwd, gps_heading, (gps_heading + 180) % 360)
+    else:
+        df['machine_heading'] = gps_heading # Nouzovka, pokud nemáš data o směru (bude to dělat ty chyby v offsetech)
+        st.warning("Není vybrán sloupec 'Směr jízdy'. Příčný offset se bude při couvání překlápět na druhou stranu!")
+
+    # 4. PROMÍTNUTÍ NA STŘED VÁLCE (Pomocí správného fyzického natočení stroje)
+    df['mid_lon'], df['mid_lat'], _ = geod.fwd(df['lon'].values, df['lat'].values, df['machine_heading'].values, np.full(len(df), offset_fwd))
+    h_right = (df['machine_heading'] - 90) % 360 if offset_right < 0 else (df['machine_heading'] + 90) % 360
     df['drum_lon'], df['drum_lat'], _ = geod.fwd(df['mid_lon'].values, df['mid_lat'].values, h_right, np.full(len(df), abs(offset_right)))
 
     # IDENTIFIKACE HISTORIE (Zásahy zkoušky)
     historie_pojezdu = []
-    df_zasazene = pd.DataFrame() # Pro uložení lokálních bodů zasažených pojezdů
+    df_zasazene = pd.DataFrame() 
 
     for p_id, group in df.groupby('pass_id'):
         _, _, dists = geod.inv(group['drum_lon'].values, group['drum_lat'].values, np.full(len(group), target_lon), np.full(len(group), target_lat))
         idx_cpa = np.argmin(dists)
         radial_dist = dists[idx_cpa]
         
-        # Pojistka: bod musí být aspoň do 5 metrů, aby to byl vůbec průjezd kolem
+        # Pojistka: bod musí být aspoň do 5 metrů
         if radial_dist < 5.0:
             cpa_row = group.iloc[idx_cpa]
             az_to_target, _, _ = geod.inv(cpa_row['drum_lon'], cpa_row['drum_lat'], target_lon, target_lat)
-            cross_track = abs(radial_dist * math.sin(math.radians(az_to_target - cpa_row['heading'])))
+            # Příčná odchylka se počítá od fyzického natočení stroje
+            cross_track = abs(radial_dist * math.sin(math.radians(az_to_target - cpa_row['machine_heading'])))
             
             # Trefil válec zkoušku?
             if cross_track <= (roller_width / 2):
@@ -108,7 +122,6 @@ if uploaded_file is not None:
                 kandidati = group_local.nsmallest(2, 'dist_to_test_m')
                 avg_kb = kandidati['Kb'].mean()
                 
-                # Uložíme záznam do historie
                 historie_pojezdu.append({
                     'Real_Pass_ID': p_id,
                     'Čas protnutí': cpa_row['parsed_time'],
@@ -117,7 +130,6 @@ if uploaded_file is not None:
                     'Amplituda': round(cpa_row['Amp'], 2) if col_vib else "N/A"
                 })
                 
-                # Uložíme si lokální body pro mapu (+- 5 vteřin od protnutí)
                 cpa_time = cpa_row['parsed_time']
                 vyrez = group[
                     (group['parsed_time'] >= cpa_time - pd.Timedelta(seconds=5)) & 
@@ -131,7 +143,6 @@ if uploaded_file is not None:
     if not historie_pojezdu:
         st.error("Žádný pojezd v datech netrefil zkoušku (osy byly příliš daleko).")
     else:
-        # Převedeme historii na DataFrame a srovnáme chronologicky
         df_hist = pd.DataFrame(historie_pojezdu).sort_values('Čas protnutí').reset_index(drop=True)
         df_hist.insert(0, 'Pořadí zkoušky', df_hist.index + 1)
         
@@ -143,23 +154,20 @@ if uploaded_file is not None:
             st.subheader("Globální pohled na stavbu")
             fig_global = go.Figure()
             
-            # Šedé pozadí - všechny pojezdy
             fig_global.add_trace(go.Scattergl(
                 x=df['drum_lon'], y=df['drum_lat'], mode='lines', 
                 line=dict(color='lightgrey', width=1), name='Ostatní provoz'
             ))
             
-            # Barevné čáry pro zasažené pojezdy
             for idx, row in df_hist.iterrows():
                 p_id = row['Real_Pass_ID']
                 c = color_seq[idx % len(color_seq)]
                 p_data = df_zasazene[df_zasazene['Real_Pass_ID'] == p_id]
                 
-                # Polygon pásu pro daný pojezd
                 hl_lon, hl_lat, hr_lon, hr_lat = [], [], [], []
                 for _, r in p_data.iterrows():
-                    l_lon, l_lat, _ = geod.fwd(r['drum_lon'], r['drum_lat'], (r['heading'] - 90) % 360, roller_width / 2)
-                    r_lon, r_lat, _ = geod.fwd(r['drum_lon'], r['drum_lat'], (r['heading'] + 90) % 360, roller_width / 2)
+                    l_lon, l_lat, _ = geod.fwd(r['drum_lon'], r['drum_lat'], (r['machine_heading'] - 90) % 360, roller_width / 2)
+                    r_lon, r_lat, _ = geod.fwd(r['drum_lon'], r['drum_lat'], (r['machine_heading'] + 90) % 360, roller_width / 2)
                     hl_lon.append(l_lon); hl_lat.append(l_lat)
                     hr_lon.append(r_lon); hr_lat.append(r_lat)
                 
@@ -191,7 +199,6 @@ if uploaded_file is not None:
             
             with col_map:
                 fig_local = go.Figure()
-                # Zde kreslíme jen osy s body a Kb pro přehlednost
                 for idx, row in df_hist.iterrows():
                     p_id = row['Real_Pass_ID']
                     c = color_seq[idx % len(color_seq)]
@@ -251,3 +258,5 @@ if uploaded_file is not None:
                     xaxis=dict(dtick=1)
                 )
                 st.plotly_chart(fig_curve, use_container_width=True)
+else:
+    st.info("Nahraj data. A nezapomeň nastavit sloupec pro 'Směr jízdy'!")
